@@ -29,8 +29,8 @@
 		}
 	},
 	"scripts": {
-		"prepublishOnly": "bun run build",
-		"build": "bun run clean && bun run generate-schema && bun build index.ts --outdir dist --target bun --format esm --external @opencode/plugin && bunx tsc -p tsconfig.build.json --emitDeclarationOnly",
+		"prepublishOnly": "bun run compile",
+		"compile": "bun run clean && bun run generate-schema && bun build index.ts --outdir dist --target bun --format esm --external @opencode/plugin && bunx tsc -p tsconfig.build.json --emitDeclarationOnly",
 		"generate-schema": "bun scripts/generate-schema.ts",
 		"clean": "rm -rf dist",
 		"test": "bun test",
