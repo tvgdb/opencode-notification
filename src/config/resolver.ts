@@ -1,18 +1,27 @@
-import type { Event } from "@opencode-ai/sdk";
+import type { OpenCodeEvent } from "@opencode/client";
 import type { Config, EventConfig } from "@/config/schema";
 
-type EventType = Event["type"] | "permission.asked" | "permission.replied" | "question.asked";
+export type NotificationEventType =
+	| OpenCodeEvent["type"]
+	| "session.error"
+	| "question.asked"
+	| "question.replied";
+
 const EVENT_CONFIG_MAP: Record<string, keyof Config | undefined> = {
 	"session.idle": "response_ready",
+	"session.execution.succeeded": "response_ready",
 	"session.error": "error",
+	"session.execution.failed": "error",
+	"session.compaction.failed": "error",
 	"permission.asked": "permission_asked",
 	"question.asked": "question_asked",
+	"form.created": "question_asked",
 };
 
 export interface ResolvedConfig {
 	readonly globalEnabled: boolean;
-	isEnabled(eventType: EventType): boolean;
-	getDelay(eventType: EventType): number;
+	isEnabled(eventType: NotificationEventType): boolean;
+	getDelay(eventType: NotificationEventType): number;
 }
 
 export function createResolvedConfig(config: Config): ResolvedConfig {
@@ -23,7 +32,7 @@ export function createResolvedConfig(config: Config): ResolvedConfig {
 			return globalEnabled;
 		},
 
-		isEnabled(eventType: EventType): boolean {
+		isEnabled(eventType: NotificationEventType): boolean {
 			const configKey = EVENT_CONFIG_MAP[eventType];
 			// TS infers config[keyof Config] as union; cast safe since Zod validates + configKey from EVENT_CONFIG_MAP
 			const eventConfig: EventConfig | undefined = configKey
@@ -37,7 +46,7 @@ export function createResolvedConfig(config: Config): ResolvedConfig {
 			return globalEnabled;
 		},
 
-		getDelay(eventType: EventType): number {
+		getDelay(eventType: NotificationEventType): number {
 			const configKey = EVENT_CONFIG_MAP[eventType];
 			// TS infers config[keyof Config] as union; cast safe since Zod validates + configKey from EVENT_CONFIG_MAP
 			const eventConfig: EventConfig | undefined = configKey

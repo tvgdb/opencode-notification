@@ -1,56 +1,119 @@
 import path from "node:path";
-import type { Plugin } from "@opencode-ai/plugin";
+import { Plugin } from "@opencode/plugin";
+import type { OpenCodeEvent, SessionID } from "@opencode/client";
 import { createNotificationScheduler } from "@/notification-scheduler";
 import { loadConfig, ConfigError } from "@/config/loader";
 import { createResolvedConfig } from "@/config/resolver";
+import { createLogger } from "@/logger";
 
-export const SimpleNotificationPlugin: Plugin = async ({ client, directory }) => {
-	const config = await loadConfig(directory).catch(async (error) => {
-		const message =
-			error instanceof ConfigError
-				? `Notification plugin config error: ${error.message}`
-				: `Notification plugin failed to load: ${error instanceof Error ? error.message : String(error)}`;
-		await client.tui.showToast({ body: { message, variant: "error" } });
-		throw error;
-	});
+const logger = createLogger("opencode-notification");
 
-	const resolvedConfig = createResolvedConfig(config);
-	const scheduler = createNotificationScheduler(resolvedConfig);
-	// Tracks sessions where assistant has responded since last user message
-	const activeSessions = new Set<string>();
-	// Tracks sessions interrupted explicitly by user command
-	const interruptedSessions = new Set<string>();
+export const SimpleNotificationPlugin = Plugin.define({
+	id: "opencode-notification",
+	async setup(ctx) {
+		const config = await loadConfig(ctx.location.directory, ctx.options).catch((error) => {
+			const message =
+				error instanceof ConfigError
+					? `Notification plugin config error: ${error.message}`
+					: `Notification plugin failed to load: ${error instanceof Error ? error.message : String(error)}`;
+			logger.error(message);
+			throw error;
+		});
 
-	const cancelForSession = (sessionId: string) => {
-		scheduler.cancelForSession(sessionId);
-		activeSessions.delete(sessionId);
-	};
+		const resolvedConfig = createResolvedConfig(config);
+		const scheduler = createNotificationScheduler(resolvedConfig);
+		// Tracks sessions where assistant has responded since last user message
+		const activeSessions = new Set<string>();
+		// Tracks sessions interrupted explicitly by user command
+		const interruptedSessions = new Set<string>();
 
-	const markSessionInterrupted = (sessionId: string) => {
-		interruptedSessions.add(sessionId);
-		cancelForSession(sessionId);
-	};
+		const cancelForSession = (sessionId: string) => {
+			scheduler.cancelForSession(sessionId);
+			activeSessions.delete(sessionId);
+		};
 
-	const isDeniedReply = (response: unknown) => {
-		const normalized = String(response ?? "")
-			.trim()
-			.toLowerCase();
+		const markSessionInterrupted = (sessionId: string) => {
+			interruptedSessions.add(sessionId);
+			cancelForSession(sessionId);
+		};
 
-		return (
-			normalized.includes("deny") ||
-			normalized.includes("reject") ||
-			normalized.includes("interrupt") ||
-			normalized.includes("cancel") ||
-			normalized.includes("abort") ||
-			normalized === "esc"
-		);
-	};
+		const isDeniedReply = (response: unknown) => {
+			const normalized = String(response ?? "")
+				.trim()
+				.toLowerCase();
 
-	return {
-		event: async ({ event }) => {
+			return (
+				normalized.includes("deny") ||
+				normalized.includes("reject") ||
+				normalized.includes("interrupt") ||
+				normalized.includes("cancel") ||
+				normalized.includes("abort") ||
+				normalized === "esc"
+			);
+		};
+
+		const isAbortedError = (error?: { type?: string; name?: string; message?: string }) => {
+			if (!error) return false;
+			const kind = (error.type ?? error.name ?? "").toLowerCase();
+			return (
+				error.type === "MessageAbortedError" ||
+				error.name === "MessageAbortedError" ||
+				kind.includes("abort") ||
+				kind.includes("interrupt")
+			);
+		};
+
+		const getSessionDetails = async (sessionId: string, fallbackDirectory?: string) => {
+			if (sessionId === "global") {
+				return {
+					title: sessionId,
+					directory: fallbackDirectory ?? ctx.location.directory,
+				};
+			}
+			const session = await ctx.session
+				.get({ sessionID: sessionId as SessionID })
+				.catch(() => null);
+			return {
+				title: session?.title ?? sessionId,
+				directory: session?.location?.directory ?? fallbackDirectory ?? ctx.location.directory,
+			};
+		};
+
+		await ctx.session.hook("prompt", (event) => {
+			interruptedSessions.delete(event.sessionID);
+			cancelForSession(event.sessionID);
+		});
+
+		const handleEvent = async (event: OpenCodeEvent) => {
 			switch (event.type) {
+				case "session.execution.started":
+				case "session.step.started": {
+					const sessionId = event.data.sessionID;
+					interruptedSessions.delete(sessionId);
+					scheduler.cancelForSession(sessionId);
+					activeSessions.add(sessionId);
+					return;
+				}
+
+				case "session.inbox.enqueued": {
+					const sessionId = event.data.sessionID;
+					if (event.data.item.type === "user") {
+						interruptedSessions.delete(sessionId);
+						cancelForSession(sessionId);
+					}
+					return;
+				}
+
+				case "session.inbox.delivered": {
+					const sessionId = event.data.sessionID;
+					interruptedSessions.delete(sessionId);
+					scheduler.cancelForSession(sessionId);
+					return;
+				}
+
+				case "session.execution.succeeded":
 				case "session.idle": {
-					const sessionId = event.properties.sessionID;
+					const sessionId = event.data.sessionID;
 
 					if (interruptedSessions.has(sessionId)) {
 						interruptedSessions.delete(sessionId);
@@ -58,77 +121,54 @@ export const SimpleNotificationPlugin: Plugin = async ({ client, directory }) =>
 						return;
 					}
 
-					if (!activeSessions.has(sessionId)) return;
+					if (event.type === "session.idle" && !activeSessions.has(sessionId)) return;
 
-					const session = await client.session.get({ path: { id: sessionId } }).catch(() => null);
-					const title = session?.data?.title ?? sessionId;
-
-					scheduler.schedule(sessionId, "Response ready", title, "session.idle");
 					activeSessions.delete(sessionId);
+					const { title } = await getSessionDetails(sessionId, event.location?.directory);
+					scheduler.schedule(sessionId, "Response ready", title, event.type);
 					return;
 				}
 
-				case "session.error": {
-					const sessionId = event.properties.sessionID;
+				case "session.execution.failed":
+				case "session.compaction.failed": {
+					const sessionId = event.data.sessionID;
 					if (!sessionId) return;
 
-					const isAborted = event.properties.error?.name === "MessageAbortedError";
-
-					if (isAborted) {
+					if (isAbortedError(event.data.error)) {
 						markSessionInterrupted(sessionId);
 						return;
 					}
 
-					const session = await client.session.get({ path: { id: sessionId } }).catch(() => null);
-					const title = session?.data?.title ?? sessionId;
-					scheduler.schedule(sessionId, "Session error", title, "session.error");
+					activeSessions.delete(sessionId);
+					const { title } = await getSessionDetails(sessionId, event.location?.directory);
+					scheduler.schedule(sessionId, "Session error", title, event.type);
 					return;
 				}
 
-				case "command.executed": {
-					const sessionId = event.properties.sessionID;
-					const commandName = event.properties.name;
-					if (commandName === "session.interrupt") {
-						markSessionInterrupted(sessionId);
-					}
+				case "session.execution.interrupted": {
+					markSessionInterrupted(event.data.sessionID);
 					return;
 				}
 
-				// @ts-ignore: SDK v1 doesn't have permission types yet
 				case "permission.asked": {
-					const sessionId = (event as { properties: { sessionID: string } }).properties.sessionID;
-					const session = await client.session.get({ path: { id: sessionId } }).catch(() => null);
-					const projectName = path.basename(session?.data?.directory ?? "");
+					const sessionId = event.data.sessionID;
+					const { title, directory } = await getSessionDetails(
+						sessionId,
+						event.location?.directory,
+					);
+					const projectName = path.basename(directory);
 					scheduler.schedule(
 						sessionId,
 						"Permission Asked",
-						`${session?.data?.title} in ${projectName} needs permission`,
+						`${title} in ${projectName} needs permission`,
 						"permission.asked",
 					);
 					return;
 				}
 
-				// @ts-ignore: SDK v1 doesn't have question types yet
-				case "question.asked": {
-					const sessionId = (event as { properties: { sessionID: string } }).properties.sessionID;
-					const session = await client.session.get({ path: { id: sessionId } }).catch(() => null);
-					const projectName = path.basename(session?.data?.directory ?? "");
-					scheduler.schedule(
-						sessionId,
-						"Question",
-						`${session?.data?.title} in ${projectName} has a question`,
-						"question.asked",
-					);
-					return;
-				}
-
-				// @ts-ignore: SDK v1 doesn't have permission types yet
-				case "permission.replied":
-				// @ts-ignore: SDK v1 doesn't have question types yet
-				case "question.replied": {
-					const sessionId = (event as { properties: { sessionID: string } }).properties.sessionID;
-					const response = (event as { properties: { response?: unknown } }).properties.response;
-					if (isDeniedReply(response)) {
+				case "permission.replied": {
+					const sessionId = event.data.sessionID;
+					if (isDeniedReply(event.data.reply)) {
 						markSessionInterrupted(sessionId);
 					} else {
 						cancelForSession(sessionId);
@@ -136,43 +176,43 @@ export const SimpleNotificationPlugin: Plugin = async ({ client, directory }) =>
 					return;
 				}
 
-				case "message.updated": {
-					const info = event.properties.info;
-
-					if (info.role === "assistant") {
-						if (info.error?.name === "MessageAbortedError") {
-							markSessionInterrupted(info.sessionID);
-							return;
-						}
-						activeSessions.add(info.sessionID);
-					} else if (info.role === "user") {
-						if (!info.agent && !info.model) {
-							interruptedSessions.delete(info.sessionID);
-							cancelForSession(info.sessionID);
-						}
-					}
+				case "form.created": {
+					const sessionId = event.data.form.sessionID;
+					const { title, directory } = await getSessionDetails(
+						sessionId,
+						event.location?.directory,
+					);
+					const projectName = path.basename(directory);
+					scheduler.schedule(
+						sessionId,
+						"Question",
+						`${title} in ${projectName} has a question`,
+						"form.created",
+					);
 					return;
 				}
 
-				case "message.part.updated": {
-					const part = event.properties.part as {
-						sessionID: string;
-						type: string;
-						state?: { status?: string; error?: string };
-					};
-					const isDismissed =
-						part.state?.status === "error" &&
-						part.state?.error?.toLowerCase().includes("dismissed");
+				case "form.replied": {
+					cancelForSession(event.data.sessionID);
+					return;
+				}
 
-					if (isDismissed && ["tool", "question", "permission"].includes(part.type)) {
-						markSessionInterrupted(part.sessionID);
+				case "form.cancelled": {
+					markSessionInterrupted(event.data.sessionID);
+					return;
+				}
+
+				case "session.tool.failed": {
+					const errorMsg = event.data.error.message.toLowerCase();
+					if (errorMsg.includes("dismissed") || isAbortedError(event.data.error)) {
+						markSessionInterrupted(event.data.sessionID);
 					}
 					return;
 				}
 
 				case "session.status": {
-					if (event.properties.status.type === "busy") {
-						scheduler.cancelForSession(event.properties.sessionID);
+					if (event.data.status.type === "busy") {
+						scheduler.cancelForSession(event.data.sessionID);
 					}
 					return;
 				}
@@ -181,12 +221,30 @@ export const SimpleNotificationPlugin: Plugin = async ({ client, directory }) =>
 				case "tui.command.execute":
 					return;
 			}
-		},
+		};
 
-		destroy: () => {
+		const controller = new AbortController();
+		void (async () => {
+			try {
+				for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
+					await handleEvent(event);
+				}
+			} catch (error) {
+				if (!controller.signal.aborted) {
+					logger.error("Event subscription error", {
+						error: error instanceof Error ? error.message : String(error),
+					});
+				}
+			}
+		})();
+
+		return () => {
+			controller.abort();
 			scheduler.cancelAll();
 			activeSessions.clear();
 			interruptedSessions.clear();
-		},
-	};
-};
+		};
+	},
+});
+
+export default SimpleNotificationPlugin;

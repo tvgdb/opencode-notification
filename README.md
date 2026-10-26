@@ -22,7 +22,24 @@ Add the plugin to your OpenCode config:
 ```json
 {
 	"$schema": "https://opencode.ai/config.json",
-	"plugin": ["opencode-notification@latest"]
+	"plugins": ["opencode-notification@latest"]
+}
+```
+
+Or pass inline options directly in `opencode.json`:
+
+```json
+{
+	"$schema": "https://opencode.ai/config.json",
+	"plugins": [
+		{
+			"package": "opencode-notification@latest",
+			"options": {
+				"delay": 15,
+				"enabled": true
+			}
+		}
+	]
 }
 ```
 

@@ -1,9 +1,12 @@
-import type { Event } from "@opencode-ai/sdk";
-import type { ResolvedConfig } from "@/config/resolver";
+import type { NotificationEventType, ResolvedConfig } from "@/config/resolver";
 import { Notification } from "@/notification";
 
-type EventType = Event["type"] | "permission.asked" | "permission.replied" | "question.asked";
-type Schedule = (sessionId: string, title: string, message: string, eventType: EventType) => void;
+type Schedule = (
+	sessionId: string,
+	title: string,
+	message: string,
+	eventType: NotificationEventType,
+) => void;
 
 interface PendingNotification {
 	title: string;
