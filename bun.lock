@@ -5,18 +5,23 @@
     "": {
       "name": "opencode-notification",
       "dependencies": {
-        "@opencode/plugin": "^2.1.4",
         "zod": "^4.3.6",
       },
       "devDependencies": {
+        "@opencode/plugin": "^2.1.4",
         "@types/bun": "latest",
         "oxfmt": "^0.38.0",
         "oxlint": "^1.51.0",
         "typescript": "^5",
       },
       "peerDependencies": {
+        "@opencode/plugin": ">=2.0.0",
         "typescript": "^5",
       },
+      "optionalPeers": [
+        "@opencode/plugin",
+        "typescript",
+      ],
     },
   },
   "packages": {

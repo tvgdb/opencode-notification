@@ -29,26 +29,35 @@
 		}
 	},
 	"scripts": {
-		"prepack": "bun run build",
+		"prepublishOnly": "bun run build",
 		"build": "bun run clean && bun run generate-schema && bun build index.ts --outdir dist --target bun --format esm --external @opencode/plugin && bunx tsc -p tsconfig.build.json --emitDeclarationOnly",
 		"generate-schema": "bun scripts/generate-schema.ts",
 		"clean": "rm -rf dist",
 		"test": "bun test",
-		"lint": "oxlint .",
+		"lint": "oxlint --ignore-pattern dist .",
 		"fmt": "oxfmt",
 		"fmt:check": "oxfmt --check"
 	},
 	"dependencies": {
-		"@opencode/plugin": "^2.1.4",
 		"zod": "^4.3.6"
 	},
 	"devDependencies": {
+		"@opencode/plugin": "^2.1.4",
 		"@types/bun": "latest",
 		"oxfmt": "^0.38.0",
 		"oxlint": "^1.51.0",
 		"typescript": "^5"
 	},
 	"peerDependencies": {
+		"@opencode/plugin": ">=2.0.0",
 		"typescript": "^5"
+	},
+	"peerDependenciesMeta": {
+		"@opencode/plugin": {
+			"optional": true
+		},
+		"typescript": {
+			"optional": true
+		}
 	}
 }
