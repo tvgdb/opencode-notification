@@ -25,12 +25,23 @@
 	"exports": {
 		".": {
 			"types": "./dist/index.d.ts",
-			"import": "./dist/index.js"
+			"import": "./dist/index.js",
+			"default": "./dist/index.js"
+		},
+		"./tui": {
+			"types": "./dist/tui.d.ts",
+			"import": "./dist/tui.js",
+			"default": "./dist/tui.js"
+		},
+		"./rpc": {
+			"types": "./dist/rpc.d.ts",
+			"import": "./dist/rpc.js",
+			"default": "./dist/rpc.js"
 		}
 	},
 	"scripts": {
 		"prepublishOnly": "bun run compile",
-		"compile": "bun run clean && bun run generate-schema && bun build index.ts --outdir dist --target bun --format esm --external @opencode/plugin && bunx tsc -p tsconfig.build.json --emitDeclarationOnly",
+		"compile": "bun run clean && bun run generate-schema && bun build index.ts tui.ts rpc.ts --outdir dist --target bun --format esm --external @opencode/plugin --external @opencode/plugin/tui --external @opencode/plugin/rpc && bunx tsc -p tsconfig.build.json --emitDeclarationOnly",
 		"generate-schema": "bun scripts/generate-schema.ts",
 		"clean": "rm -rf dist",
 		"test": "bun test",
@@ -46,6 +57,7 @@
 		"@types/bun": "latest",
 		"oxfmt": "^0.38.0",
 		"oxlint": "^1.51.0",
+		"solid-js": "^1.9.15",
 		"typescript": "^5"
 	},
 	"peerDependencies": {

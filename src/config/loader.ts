@@ -97,7 +97,7 @@ export async function discoverConfigFiles(projectRoot?: string): Promise<string[
  */
 export async function loadConfig(
 	projectRoot: string,
-	inlineOptions?: Record<string, unknown>,
+	...inlineOptionsList: (Record<string, unknown> | undefined)[]
 ): Promise<Config> {
 	const filePaths = await discoverConfigFiles(projectRoot);
 	const configs: Record<string, unknown>[] = [];
@@ -109,19 +109,19 @@ export async function loadConfig(
 				configs.push(content as Record<string, unknown>);
 			}
 		} catch (error) {
-			// JSON parse errors are fatal - user has a config file but it's broken
 			if (error instanceof SyntaxError) {
 				throw new ConfigError(`Invalid JSON in ${filePath}: ${error.message}`);
 			}
-			// Other errors (e.g., file not readable) are also fatal
 			throw new ConfigError(
 				`Failed to read config file ${filePath}: ${error instanceof Error ? error.message : String(error)}`,
 			);
 		}
 	}
 
-	if (inlineOptions && typeof inlineOptions === "object" && !Array.isArray(inlineOptions)) {
-		configs.push(inlineOptions);
+	for (const inlineOptions of inlineOptionsList) {
+		if (inlineOptions && typeof inlineOptions === "object" && !Array.isArray(inlineOptions)) {
+			configs.push(inlineOptions);
+		}
 	}
 
 	const mergedConfig = configs.reduce<Record<string, unknown>>(

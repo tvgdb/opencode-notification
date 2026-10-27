@@ -1,7 +1,32 @@
 // @bun
 // index.ts
-import path from "path";
 import { Plugin } from "@opencode/plugin";
+
+// rpc.ts
+import { Rpc } from "@opencode/plugin/rpc";
+var NotificationRpc = Rpc.define({
+  id: "opencode-notification",
+  methods: {
+    getOptions: {
+      input: {
+        type: "object",
+        additionalProperties: false
+      },
+      output: {
+        type: "object",
+        properties: {
+          options: {
+            type: "object"
+          }
+        },
+        required: ["options"],
+        additionalProperties: false
+      }
+    }
+  },
+  events: {}
+});
+var rpc_default = NotificationRpc;
 
 // src/notification.ts
 import { readFileSync } from "fs";
@@ -62,9 +87,16 @@ function notifyLinux(title, message) {
     args.push("-a", terminal.appName);
     args.push("-i", terminal.icon);
   }
-  Bun.spawn([...args, title, message], {
+  const proc = Bun.spawn([...args, title, message], {
     stdout: "ignore",
     stderr: "ignore"
+  });
+  proc.exited.then((exitCode) => {
+    if (exitCode !== 0) {
+      notifyBell();
+    }
+  }).catch(() => {
+    notifyBell();
   });
 }
 function escapeForAppleScript(text) {
@@ -116,6 +148,8 @@ function notifyWindows(title, message) {
 function notifyBell() {
   if (process.stdout.isTTY) {
     process.stdout.write("\x07");
+  } else if (process.stderr.isTTY) {
+    process.stderr.write("\x07");
   }
 }
 var Notification;
@@ -173,6 +207,214 @@ function createNotificationScheduler(resolvedConfig) {
     schedule,
     cancelForSession,
     cancelAll
+  };
+}
+
+// src/event-handler.ts
+import path from "path";
+function isDeniedReply(response) {
+  const normalized = String(response ?? "").trim().toLowerCase();
+  return normalized.includes("deny") || normalized.includes("reject") || normalized.includes("interrupt") || normalized.includes("cancel") || normalized.includes("abort") || normalized === "esc";
+}
+function isAbortedError(error) {
+  if (!error)
+    return false;
+  const kind = (error.type ?? error.name ?? "").toLowerCase();
+  return error.type === "MessageAbortedError" || error.name === "MessageAbortedError" || kind.includes("abort") || kind.includes("interrupt");
+}
+function createNotificationEventHandler({
+  scheduler,
+  getSessionDetails,
+  shouldHandleSession,
+  isSuppressed
+}) {
+  const activeSessions = new Set;
+  const interruptedSessions = new Set;
+  const childToRoot = new Map;
+  const recordHierarchy = (sessionId, details) => {
+    const rootId = details.rootSessionID ?? details.parentID;
+    if (rootId && rootId !== sessionId) {
+      childToRoot.set(sessionId, childToRoot.get(rootId) ?? rootId);
+    }
+  };
+  const cancelOnlyTimers = (sessionId) => {
+    scheduler.cancelForSession(sessionId);
+    for (const [childId, rootId] of childToRoot) {
+      if (rootId === sessionId) {
+        scheduler.cancelForSession(childId);
+      }
+    }
+  };
+  const cancelForSession = (sessionId) => {
+    cancelOnlyTimers(sessionId);
+    activeSessions.delete(sessionId);
+  };
+  const markSessionInterrupted = (sessionId) => {
+    interruptedSessions.add(sessionId);
+    cancelForSession(sessionId);
+    for (const [childId, rootId] of childToRoot) {
+      if (rootId === sessionId) {
+        interruptedSessions.add(childId);
+        activeSessions.delete(childId);
+      }
+    }
+  };
+  const onPrompt = (sessionId) => {
+    interruptedSessions.delete(sessionId);
+    cancelForSession(sessionId);
+  };
+  const handleEvent = async (event) => {
+    switch (event.type) {
+      case "session.created":
+      case "session.forked": {
+        if (event.data.parentID) {
+          const rootId = childToRoot.get(event.data.parentID) ?? event.data.parentID;
+          childToRoot.set(event.data.sessionID, rootId);
+        }
+        return;
+      }
+      case "session.deleted": {
+        const sessionId = event.data.sessionID;
+        cancelForSession(sessionId);
+        interruptedSessions.delete(sessionId);
+        childToRoot.delete(sessionId);
+        return;
+      }
+      case "session.execution.started":
+      case "session.step.started": {
+        const sessionId = event.data.sessionID;
+        interruptedSessions.delete(sessionId);
+        cancelOnlyTimers(sessionId);
+        activeSessions.add(sessionId);
+        return;
+      }
+      case "session.inbox.enqueued": {
+        const sessionId = event.data.sessionID;
+        if (event.data.item.type === "user") {
+          onPrompt(sessionId);
+        }
+        return;
+      }
+      case "session.inbox.delivered": {
+        const sessionId = event.data.sessionID;
+        interruptedSessions.delete(sessionId);
+        cancelOnlyTimers(sessionId);
+        return;
+      }
+      case "session.execution.succeeded":
+      case "session.idle": {
+        const sessionId = event.data.sessionID;
+        if (interruptedSessions.has(sessionId)) {
+          interruptedSessions.delete(sessionId);
+          activeSessions.delete(sessionId);
+          return;
+        }
+        if (event.type === "session.idle" && !activeSessions.has(sessionId))
+          return;
+        activeSessions.delete(sessionId);
+        if (isSuppressed?.())
+          return;
+        const details = await getSessionDetails(sessionId, event.location?.directory);
+        recordHierarchy(sessionId, details);
+        if (details.parentID)
+          return;
+        if (shouldHandleSession && !shouldHandleSession(sessionId, details))
+          return;
+        scheduler.schedule(sessionId, "Response ready", details.title, event.type);
+        return;
+      }
+      case "session.execution.failed":
+      case "session.compaction.failed": {
+        const sessionId = event.data.sessionID;
+        if (!sessionId)
+          return;
+        if (isAbortedError(event.data.error)) {
+          markSessionInterrupted(sessionId);
+          return;
+        }
+        activeSessions.delete(sessionId);
+        if (isSuppressed?.())
+          return;
+        const details = await getSessionDetails(sessionId, event.location?.directory);
+        recordHierarchy(sessionId, details);
+        if (shouldHandleSession && !shouldHandleSession(sessionId, details))
+          return;
+        scheduler.schedule(sessionId, "Session error", details.title, event.type);
+        return;
+      }
+      case "session.execution.interrupted": {
+        markSessionInterrupted(event.data.sessionID);
+        return;
+      }
+      case "permission.asked": {
+        if (isSuppressed?.())
+          return;
+        const sessionId = event.data.sessionID;
+        const details = await getSessionDetails(sessionId, event.location?.directory);
+        recordHierarchy(sessionId, details);
+        if (shouldHandleSession && !shouldHandleSession(sessionId, details))
+          return;
+        const projectName = path.basename(details.directory);
+        scheduler.schedule(sessionId, "Permission Asked", `${details.title} in ${projectName} needs permission`, "permission.asked");
+        return;
+      }
+      case "permission.replied": {
+        const sessionId = event.data.sessionID;
+        if (isDeniedReply(event.data.reply)) {
+          markSessionInterrupted(sessionId);
+        } else {
+          cancelForSession(sessionId);
+        }
+        return;
+      }
+      case "form.created": {
+        if (isSuppressed?.())
+          return;
+        const sessionId = event.data.form.sessionID;
+        const details = await getSessionDetails(sessionId, event.location?.directory);
+        recordHierarchy(sessionId, details);
+        if (shouldHandleSession && !shouldHandleSession(sessionId, details))
+          return;
+        const projectName = path.basename(details.directory);
+        scheduler.schedule(sessionId, "Question", `${details.title} in ${projectName} has a question`, "form.created");
+        return;
+      }
+      case "form.replied": {
+        cancelForSession(event.data.sessionID);
+        return;
+      }
+      case "form.cancelled": {
+        markSessionInterrupted(event.data.sessionID);
+        return;
+      }
+      case "session.tool.failed": {
+        const errorMsg = event.data.error.message.toLowerCase();
+        if (errorMsg.includes("dismissed") || isAbortedError(event.data.error)) {
+          markSessionInterrupted(event.data.sessionID);
+        }
+        return;
+      }
+      case "session.status": {
+        if (event.data.status.type === "busy") {
+          cancelOnlyTimers(event.data.sessionID);
+        }
+        return;
+      }
+      case "tui.prompt.append":
+      case "tui.command.execute":
+        return;
+    }
+  };
+  const dispose = () => {
+    scheduler.cancelAll();
+    activeSessions.clear();
+    interruptedSessions.clear();
+    childToRoot.clear();
+  };
+  return {
+    handleEvent,
+    onPrompt,
+    dispose
   };
 }
 
@@ -3279,7 +3521,7 @@ async function discoverConfigFiles(projectRoot) {
   }
   return paths;
 }
-async function loadConfig(projectRoot, inlineOptions) {
+async function loadConfig(projectRoot, ...inlineOptionsList) {
   const filePaths = await discoverConfigFiles(projectRoot);
   const configs = [];
   for (const filePath of filePaths) {
@@ -3295,8 +3537,10 @@ async function loadConfig(projectRoot, inlineOptions) {
       throw new ConfigError(`Failed to read config file ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  if (inlineOptions && typeof inlineOptions === "object" && !Array.isArray(inlineOptions)) {
-    configs.push(inlineOptions);
+  for (const inlineOptions of inlineOptionsList) {
+    if (inlineOptions && typeof inlineOptions === "object" && !Array.isArray(inlineOptions)) {
+      configs.push(inlineOptions);
+    }
   }
   const mergedConfig = configs.reduce((acc, config) => deepMerge(acc, config), {});
   try {
@@ -3374,33 +3618,22 @@ var logger = createLogger("opencode-notification");
 var SimpleNotificationPlugin = Plugin.define({
   id: "opencode-notification",
   async setup(ctx) {
-    const config = await loadConfig(ctx.location.directory, ctx.options).catch((error) => {
+    const inlineOptions = ctx.options && typeof ctx.options === "object" && !Array.isArray(ctx.options) ? ctx.options : undefined;
+    const config = await loadConfig(ctx.location.directory, inlineOptions).catch((error) => {
       const message = error instanceof ConfigError ? `Notification plugin config error: ${error.message}` : `Notification plugin failed to load: ${error instanceof Error ? error.message : String(error)}`;
       logger.error(message);
       throw error;
     });
     const resolvedConfig = createResolvedConfig(config);
     const scheduler = createNotificationScheduler(resolvedConfig);
-    const activeSessions = new Set;
-    const interruptedSessions = new Set;
-    const cancelForSession = (sessionId) => {
-      scheduler.cancelForSession(sessionId);
-      activeSessions.delete(sessionId);
-    };
-    const markSessionInterrupted = (sessionId) => {
-      interruptedSessions.add(sessionId);
-      cancelForSession(sessionId);
-    };
-    const isDeniedReply = (response) => {
-      const normalized = String(response ?? "").trim().toLowerCase();
-      return normalized.includes("deny") || normalized.includes("reject") || normalized.includes("interrupt") || normalized.includes("cancel") || normalized.includes("abort") || normalized === "esc";
-    };
-    const isAbortedError = (error) => {
-      if (!error)
-        return false;
-      const kind = (error.type ?? error.name ?? "").toLowerCase();
-      return error.type === "MessageAbortedError" || error.name === "MessageAbortedError" || kind.includes("abort") || kind.includes("interrupt");
-    };
+    let tuiConnected = false;
+    await ctx.rpc?.register?.(NotificationRpc, {
+      getOptions: async () => {
+        tuiConnected = true;
+        scheduler.cancelAll();
+        return { options: inlineOptions ?? {} };
+      }
+    });
     const getSessionDetails = async (sessionId, fallbackDirectory) => {
       if (sessionId === "global") {
         return {
@@ -3411,124 +3644,23 @@ var SimpleNotificationPlugin = Plugin.define({
       const session = await ctx.session.get({ sessionID: sessionId }).catch(() => null);
       return {
         title: session?.title ?? sessionId,
-        directory: session?.location?.directory ?? fallbackDirectory ?? ctx.location.directory
+        directory: session?.location?.directory ?? fallbackDirectory ?? ctx.location.directory,
+        parentID: session?.parentID
       };
     };
-    await ctx.session.hook("prompt", (event) => {
-      interruptedSessions.delete(event.sessionID);
-      cancelForSession(event.sessionID);
+    const handler = createNotificationEventHandler({
+      scheduler,
+      getSessionDetails,
+      isSuppressed: () => tuiConnected
     });
-    const handleEvent = async (event) => {
-      switch (event.type) {
-        case "session.execution.started":
-        case "session.step.started": {
-          const sessionId = event.data.sessionID;
-          interruptedSessions.delete(sessionId);
-          scheduler.cancelForSession(sessionId);
-          activeSessions.add(sessionId);
-          return;
-        }
-        case "session.inbox.enqueued": {
-          const sessionId = event.data.sessionID;
-          if (event.data.item.type === "user") {
-            interruptedSessions.delete(sessionId);
-            cancelForSession(sessionId);
-          }
-          return;
-        }
-        case "session.inbox.delivered": {
-          const sessionId = event.data.sessionID;
-          interruptedSessions.delete(sessionId);
-          scheduler.cancelForSession(sessionId);
-          return;
-        }
-        case "session.execution.succeeded":
-        case "session.idle": {
-          const sessionId = event.data.sessionID;
-          if (interruptedSessions.has(sessionId)) {
-            interruptedSessions.delete(sessionId);
-            activeSessions.delete(sessionId);
-            return;
-          }
-          if (event.type === "session.idle" && !activeSessions.has(sessionId))
-            return;
-          activeSessions.delete(sessionId);
-          const { title } = await getSessionDetails(sessionId, event.location?.directory);
-          scheduler.schedule(sessionId, "Response ready", title, event.type);
-          return;
-        }
-        case "session.execution.failed":
-        case "session.compaction.failed": {
-          const sessionId = event.data.sessionID;
-          if (!sessionId)
-            return;
-          if (isAbortedError(event.data.error)) {
-            markSessionInterrupted(sessionId);
-            return;
-          }
-          activeSessions.delete(sessionId);
-          const { title } = await getSessionDetails(sessionId, event.location?.directory);
-          scheduler.schedule(sessionId, "Session error", title, event.type);
-          return;
-        }
-        case "session.execution.interrupted": {
-          markSessionInterrupted(event.data.sessionID);
-          return;
-        }
-        case "permission.asked": {
-          const sessionId = event.data.sessionID;
-          const { title, directory } = await getSessionDetails(sessionId, event.location?.directory);
-          const projectName = path.basename(directory);
-          scheduler.schedule(sessionId, "Permission Asked", `${title} in ${projectName} needs permission`, "permission.asked");
-          return;
-        }
-        case "permission.replied": {
-          const sessionId = event.data.sessionID;
-          if (isDeniedReply(event.data.reply)) {
-            markSessionInterrupted(sessionId);
-          } else {
-            cancelForSession(sessionId);
-          }
-          return;
-        }
-        case "form.created": {
-          const sessionId = event.data.form.sessionID;
-          const { title, directory } = await getSessionDetails(sessionId, event.location?.directory);
-          const projectName = path.basename(directory);
-          scheduler.schedule(sessionId, "Question", `${title} in ${projectName} has a question`, "form.created");
-          return;
-        }
-        case "form.replied": {
-          cancelForSession(event.data.sessionID);
-          return;
-        }
-        case "form.cancelled": {
-          markSessionInterrupted(event.data.sessionID);
-          return;
-        }
-        case "session.tool.failed": {
-          const errorMsg = event.data.error.message.toLowerCase();
-          if (errorMsg.includes("dismissed") || isAbortedError(event.data.error)) {
-            markSessionInterrupted(event.data.sessionID);
-          }
-          return;
-        }
-        case "session.status": {
-          if (event.data.status.type === "busy") {
-            scheduler.cancelForSession(event.data.sessionID);
-          }
-          return;
-        }
-        case "tui.prompt.append":
-        case "tui.command.execute":
-          return;
-      }
-    };
+    await ctx.session.hook("prompt", (event) => {
+      handler.onPrompt(event.sessionID);
+    });
     const controller = new AbortController;
     (async () => {
       try {
         for await (const event of ctx.event.subscribe({ signal: controller.signal })) {
-          await handleEvent(event);
+          await handler.handleEvent(event);
         }
       } catch (error) {
         if (!controller.signal.aborted) {
@@ -3540,9 +3672,7 @@ var SimpleNotificationPlugin = Plugin.define({
     })();
     return () => {
       controller.abort();
-      scheduler.cancelAll();
-      activeSessions.clear();
-      interruptedSessions.clear();
+      handler.dispose();
     };
   }
 });

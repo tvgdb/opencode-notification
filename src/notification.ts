@@ -63,10 +63,21 @@ function notifyLinux(title: string, message: string): void {
 		args.push("-i", terminal.icon);
 	}
 
-	Bun.spawn([...args, title, message], {
+	const proc = Bun.spawn([...args, title, message], {
 		stdout: "ignore",
 		stderr: "ignore",
 	});
+	// Fall back to the terminal bell if notify-send is installed in a headless
+	// container or SSH session where no D-Bus notification daemon is running.
+	void proc.exited
+		.then((exitCode) => {
+			if (exitCode !== 0) {
+				notifyBell();
+			}
+		})
+		.catch(() => {
+			notifyBell();
+		});
 }
 
 function escapeForAppleScript(text: string): string {
@@ -125,6 +136,8 @@ function notifyWindows(title: string, message: string): void {
 function notifyBell(): void {
 	if (process.stdout.isTTY) {
 		process.stdout.write("\x07");
+	} else if (process.stderr.isTTY) {
+		process.stderr.write("\x07");
 	}
 }
 

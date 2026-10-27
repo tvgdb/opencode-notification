@@ -1,6 +1,6 @@
 import type { NotificationEventType, ResolvedConfig } from "@/config/resolver";
 type Schedule = (sessionId: string, title: string, message: string, eventType: NotificationEventType) => void;
-interface NotificationScheduler {
+export interface NotificationScheduler {
     schedule: Schedule;
     cancelForSession: (sessionId: string) => void;
     cancelAll: () => void;

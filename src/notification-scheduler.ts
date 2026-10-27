@@ -13,7 +13,7 @@ interface PendingNotification {
 	message: string;
 	timeoutId: ReturnType<typeof setTimeout>;
 }
-interface NotificationScheduler {
+export interface NotificationScheduler {
 	schedule: Schedule;
 	cancelForSession: (sessionId: string) => void;
 	cancelAll: () => void;

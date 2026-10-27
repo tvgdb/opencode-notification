@@ -20,5 +20,5 @@ export declare function discoverConfigFiles(projectRoot?: string): Promise<strin
  *         This ensures the plugin fails fast on misconfiguration rather than
  *         silently using defaults.
  */
-export declare function loadConfig(projectRoot: string, inlineOptions?: Record<string, unknown>): Promise<Config>;
+export declare function loadConfig(projectRoot: string, ...inlineOptionsList: (Record<string, unknown> | undefined)[]): Promise<Config>;
 //# sourceMappingURL=loader.d.ts.map
