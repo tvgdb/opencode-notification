@@ -3,7 +3,7 @@ import type { SessionID } from "@opencode/client";
 import { NotificationRpc } from "./rpc";
 import { createNotificationScheduler } from "@/notification-scheduler";
 import { createNotificationEventHandler, type SessionDetails } from "@/event-handler";
-import { loadConfig, ConfigError } from "@/config/loader";
+import { loadConfig, ConfigError, isAutoAcceptMode } from "@/config/loader";
 import { createResolvedConfig } from "@/config/resolver";
 import { createLogger } from "@/logger";
 
@@ -68,6 +68,7 @@ export const SimpleNotificationPlugin = Plugin.define({
 			scheduler,
 			getSessionDetails,
 			isSuppressed: () => tuiConnected,
+			isAutoAccept: (directory) => isAutoAcceptMode(directory ?? ctx.location.directory),
 		});
 
 		await ctx.session.hook("prompt", (event) => {

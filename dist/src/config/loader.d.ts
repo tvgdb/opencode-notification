@@ -21,4 +21,13 @@ export declare function discoverConfigFiles(projectRoot?: string): Promise<strin
  *         silently using defaults.
  */
 export declare function loadConfig(projectRoot: string, ...inlineOptionsList: (Record<string, unknown> | undefined)[]): Promise<Config>;
+/**
+ * Checks whether OpenCode was launched with CLI flags that auto-approve permissions.
+ */
+export declare function hasAutoAcceptCliFlag(argv?: readonly string[]): boolean;
+/**
+ * Determines whether OpenCode is currently in "auto" permission mode (`autoaccept`),
+ * where permission prompts are automatically accepted without stopping for user input.
+ */
+export declare function isAutoAcceptMode(projectDirectory?: string, argv?: readonly string[]): Promise<boolean>;
 //# sourceMappingURL=loader.d.ts.map

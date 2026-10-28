@@ -1,4 +1,6 @@
+import { stat } from "node:fs/promises";
 import { homedir } from "node:os";
+import path from "node:path";
 import { ConfigSchema, type Config } from "@/config/schema";
 import { CONFIG_FILE_NAME } from "@/config/constants";
 
@@ -136,4 +138,136 @@ export async function loadConfig(
 		const message = error instanceof Error ? error.message : String(error);
 		throw new ConfigError(`Config validation failed: ${message}`);
 	}
+}
+
+type SessionPermissionsMode = "autoaccept" | "prompt";
+
+interface CachedCliConfigEntry {
+	mtimeMs: number;
+	size: number;
+	permissions: SessionPermissionsMode | undefined;
+}
+
+const cliConfigCache = new Map<string, CachedCliConfigEntry>();
+
+function parseJsonOrJsonc(text: string): unknown {
+	const jsoncParser = (Bun as unknown as { JSONC?: { parse?: (input: string) => unknown } }).JSONC
+		?.parse;
+	if (typeof jsoncParser === "function") {
+		return jsoncParser(text);
+	}
+	return JSON.parse(text);
+}
+
+function extractSessionPermissionsMode(value: unknown): SessionPermissionsMode | undefined {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return undefined;
+	const session = (value as Record<string, unknown>).session;
+	if (!session || typeof session !== "object" || Array.isArray(session)) return undefined;
+	const permissions = (session as Record<string, unknown>).permissions;
+	if (permissions === "autoaccept" || permissions === "prompt") {
+		return permissions;
+	}
+	return undefined;
+}
+
+/**
+ * Checks whether OpenCode was launched with CLI flags that auto-approve permissions.
+ */
+export function hasAutoAcceptCliFlag(argv: readonly string[] = process.argv.slice(2)): boolean {
+	for (const arg of argv) {
+		if (arg === "--") break;
+		if (
+			arg === "--auto" ||
+			arg === "--auto=true" ||
+			arg === "--yolo" ||
+			arg === "--yolo=true" ||
+			arg === "--dangerously-skip-permissions" ||
+			arg === "--dangerously-skip-permissions=true"
+		) {
+			return true;
+		}
+	}
+	return false;
+}
+
+function getCandidateCliConfigPaths(projectDirectory?: string): string[] {
+	const paths: string[] = [];
+
+	if (projectDirectory) {
+		paths.push(path.join(projectDirectory, ".opencode", "cli.json"));
+		paths.push(path.join(projectDirectory, "cli.json"));
+	}
+
+	if (process.env.OPENCODE_CONFIG_DIR) {
+		paths.push(path.join(process.env.OPENCODE_CONFIG_DIR, "cli.json"));
+	}
+
+	const xdgConfigHome = process.env.XDG_CONFIG_HOME || path.join(homedir(), ".config");
+	paths.push(path.join(xdgConfigHome, "opencode", "cli.json"));
+
+	if (process.platform === "win32" && process.env.APPDATA) {
+		paths.push(path.join(process.env.APPDATA, "opencode", "cli.json"));
+	}
+
+	return [...new Set(paths)];
+}
+
+async function readCliConfigPermissionsMode(
+	filePath: string,
+): Promise<SessionPermissionsMode | undefined> {
+	try {
+		const stats = await stat(filePath);
+		const cached = cliConfigCache.get(filePath);
+		if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+			return cached.permissions;
+		}
+
+		const text = await Bun.file(filePath).text();
+		const parsed = parseJsonOrJsonc(text);
+		const permissions = extractSessionPermissionsMode(parsed);
+		cliConfigCache.set(filePath, {
+			mtimeMs: stats.mtimeMs,
+			size: stats.size,
+			permissions,
+		});
+		return permissions;
+	} catch {
+		cliConfigCache.delete(filePath);
+		return undefined;
+	}
+}
+
+/**
+ * Determines whether OpenCode is currently in "auto" permission mode (`autoaccept`),
+ * where permission prompts are automatically accepted without stopping for user input.
+ */
+export async function isAutoAcceptMode(
+	projectDirectory?: string,
+	argv: readonly string[] = process.argv.slice(2),
+): Promise<boolean> {
+	if (hasAutoAcceptCliFlag(argv)) {
+		return true;
+	}
+
+	const inlineCliConfig = process.env.OPENCODE_CLI_CONFIG_CONTENT?.trim();
+	if (inlineCliConfig) {
+		try {
+			const parsed = parseJsonOrJsonc(inlineCliConfig);
+			const inlineMode = extractSessionPermissionsMode(parsed);
+			if (inlineMode !== undefined) {
+				return inlineMode === "autoaccept";
+			}
+		} catch {
+			// Ignore malformed inline config and fall back to cli.json files
+		}
+	}
+
+	for (const candidatePath of getCandidateCliConfigPaths(projectDirectory)) {
+		const mode = await readCliConfigPermissionsMode(candidatePath);
+		if (mode !== undefined) {
+			return mode === "autoaccept";
+		}
+	}
+
+	return false;
 }

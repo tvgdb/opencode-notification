@@ -11,7 +11,7 @@ import SimpleNotificationPlugin from "../index";
 import SimpleNotificationTuiPlugin from "../tui";
 import { NotificationRpc } from "../rpc";
 import { Notification } from "@/notification";
-import { loadConfig, ConfigError } from "@/config/loader";
+import { loadConfig, ConfigError, hasAutoAcceptCliFlag, isAutoAcceptMode } from "@/config/loader";
 import { createResolvedConfig } from "@/config/resolver";
 
 function createEventChannel() {
@@ -77,15 +77,36 @@ describe("opencode-notification V2 plugin", () => {
 	let tempDir: string;
 	let notifySpy: ReturnType<typeof mock>;
 	const originalNotify = Notification.notify;
+	const originalXdgConfigHome = process.env.XDG_CONFIG_HOME;
+	const originalOpencodeConfigDir = process.env.OPENCODE_CONFIG_DIR;
+	const originalOpencodeCliConfigContent = process.env.OPENCODE_CLI_CONFIG_CONTENT;
 
 	beforeEach(async () => {
 		tempDir = await mkdtemp(path.join(tmpdir(), "oc-notification-test-"));
+		process.env.XDG_CONFIG_HOME = tempDir;
+		delete process.env.OPENCODE_CONFIG_DIR;
+		delete process.env.OPENCODE_CLI_CONFIG_CONTENT;
 		notifySpy = mock(() => {});
 		Notification.notify = notifySpy;
 	});
 
 	afterEach(async () => {
 		Notification.notify = originalNotify;
+		if (originalXdgConfigHome === undefined) {
+			delete process.env.XDG_CONFIG_HOME;
+		} else {
+			process.env.XDG_CONFIG_HOME = originalXdgConfigHome;
+		}
+		if (originalOpencodeConfigDir === undefined) {
+			delete process.env.OPENCODE_CONFIG_DIR;
+		} else {
+			process.env.OPENCODE_CONFIG_DIR = originalOpencodeConfigDir;
+		}
+		if (originalOpencodeCliConfigContent === undefined) {
+			delete process.env.OPENCODE_CLI_CONFIG_CONTENT;
+		} else {
+			process.env.OPENCODE_CLI_CONFIG_CONTENT = originalOpencodeCliConfigContent;
+		}
 		await rm(tempDir, { recursive: true, force: true });
 	});
 
@@ -621,5 +642,109 @@ describe("opencode-notification V2 plugin", () => {
 				configurable: true,
 			});
 		}
+	});
+
+	it("suppresses permission.asked notifications when OpenCode is in autoaccept mode and resumes when switched to prompt", async () => {
+		const cliConfigPath = path.join(tempDir, "opencode", "cli.json");
+		await Bun.write(
+			cliConfigPath,
+			JSON.stringify({
+				session: {
+					permissions: "autoaccept",
+				},
+			}),
+		);
+
+		const { context, emit } = createMockTuiContext({
+			inlineOptions: { delay: 0 },
+			route: () => ({ type: "session", sessionID: "ses_1" }),
+		});
+		const cleanup = await SimpleNotificationTuiPlugin.setup(context);
+
+		// In autoaccept mode, permission.asked should NOT trigger a notification or bell
+		emit({
+			type: "permission.asked",
+			data: {
+				id: "perm_auto_1",
+				sessionID: "ses_1" as SessionID,
+				action: "shell",
+				resources: ["kubectl get pods"],
+			},
+		} as unknown as OpenCodeEvent);
+
+		await Bun.sleep(30);
+		expect(notifySpy).toHaveBeenCalledTimes(0);
+
+		// Questions (form.created) and Response ready should still notify in autoaccept mode
+		emit({
+			type: "form.created",
+			data: {
+				form: {
+					id: "frm_auto_1",
+					sessionID: "ses_1",
+					title: "Question",
+					fields: [],
+				},
+			},
+		} as unknown as OpenCodeEvent);
+
+		await Bun.sleep(30);
+		expect(notifySpy).toHaveBeenCalledTimes(1);
+		expect(notifySpy).toHaveBeenCalledWith({
+			title: "Question",
+			message: "Title for ses_1 in my-project has a question",
+		});
+
+		notifySpy.mockClear();
+
+		// Switching cli.json live to "prompt" re-enables permission.asked notifications
+		await Bun.sleep(10);
+		await Bun.write(
+			cliConfigPath,
+			JSON.stringify({
+				session: {
+					permissions: "prompt",
+				},
+			}),
+		);
+
+		emit({
+			type: "permission.asked",
+			data: {
+				id: "perm_prompt_1",
+				sessionID: "ses_1" as SessionID,
+				action: "shell",
+				resources: ["rm -rf /tmp/test"],
+			},
+		} as unknown as OpenCodeEvent);
+
+		await Bun.sleep(30);
+		expect(notifySpy).toHaveBeenCalledTimes(1);
+		expect(notifySpy).toHaveBeenCalledWith({
+			title: "Permission Asked",
+			message: "Title for ses_1 in my-project needs permission",
+		});
+
+		await cleanup?.();
+	});
+
+	it("detects autoaccept mode from CLI flags and OPENCODE_CLI_CONFIG_CONTENT", async () => {
+		expect(hasAutoAcceptCliFlag(["--auto"])).toBe(true);
+		expect(hasAutoAcceptCliFlag(["--yolo"])).toBe(true);
+		expect(hasAutoAcceptCliFlag(["--dangerously-skip-permissions"])).toBe(true);
+		expect(hasAutoAcceptCliFlag(["--", "--auto"])).toBe(false);
+		expect(hasAutoAcceptCliFlag(["run", "hello"])).toBe(false);
+
+		expect(await isAutoAcceptMode(tempDir, ["--auto"])).toBe(true);
+
+		process.env.OPENCODE_CLI_CONFIG_CONTENT = JSON.stringify({
+			session: { permissions: "autoaccept" },
+		});
+		expect(await isAutoAcceptMode(tempDir, [])).toBe(true);
+
+		process.env.OPENCODE_CLI_CONFIG_CONTENT = JSON.stringify({
+			session: { permissions: "prompt" },
+		});
+		expect(await isAutoAcceptMode(tempDir, [])).toBe(false);
 	});
 });

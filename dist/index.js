@@ -226,11 +226,14 @@ function createNotificationEventHandler({
   scheduler,
   getSessionDetails,
   shouldHandleSession,
-  isSuppressed
+  isSuppressed,
+  isAutoAccept
 }) {
   const activeSessions = new Set;
   const interruptedSessions = new Set;
   const childToRoot = new Map;
+  let eventQueue = Promise.resolve();
+  let disposed = false;
   const recordHierarchy = (sessionId, details) => {
     const rootId = details.rootSessionID ?? details.parentID;
     if (rootId && rootId !== sessionId) {
@@ -263,7 +266,7 @@ function createNotificationEventHandler({
     interruptedSessions.delete(sessionId);
     cancelForSession(sessionId);
   };
-  const handleEvent = async (event) => {
+  const processEvent = async (event) => {
     switch (event.type) {
       case "session.created":
       case "session.forked": {
@@ -354,6 +357,8 @@ function createNotificationEventHandler({
         recordHierarchy(sessionId, details);
         if (shouldHandleSession && !shouldHandleSession(sessionId, details))
           return;
+        if (await isAutoAccept?.(details.directory))
+          return;
         const projectName = path.basename(details.directory);
         scheduler.schedule(sessionId, "Permission Asked", `${details.title} in ${projectName} needs permission`, "permission.asked");
         return;
@@ -405,7 +410,17 @@ function createNotificationEventHandler({
         return;
     }
   };
+  const handleEvent = (event) => {
+    const next = eventQueue.then(() => {
+      if (disposed)
+        return;
+      return processEvent(event);
+    });
+    eventQueue = next.catch(() => {});
+    return next;
+  };
   const dispose = () => {
+    disposed = true;
     scheduler.cancelAll();
     activeSessions.clear();
     interruptedSessions.clear();
@@ -419,7 +434,9 @@ function createNotificationEventHandler({
 }
 
 // src/config/loader.ts
+import { stat } from "fs/promises";
 import { homedir } from "os";
+import path2 from "path";
 
 // node_modules/zod/v4/core/core.js
 var NEVER = Object.freeze({
@@ -3550,6 +3567,95 @@ async function loadConfig(projectRoot, ...inlineOptionsList) {
     throw new ConfigError(`Config validation failed: ${message}`);
   }
 }
+var cliConfigCache = new Map;
+function parseJsonOrJsonc(text) {
+  const jsoncParser = Bun.JSONC?.parse;
+  if (typeof jsoncParser === "function") {
+    return jsoncParser(text);
+  }
+  return JSON.parse(text);
+}
+function extractSessionPermissionsMode(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value))
+    return;
+  const session = value.session;
+  if (!session || typeof session !== "object" || Array.isArray(session))
+    return;
+  const permissions = session.permissions;
+  if (permissions === "autoaccept" || permissions === "prompt") {
+    return permissions;
+  }
+  return;
+}
+function hasAutoAcceptCliFlag(argv = process.argv.slice(2)) {
+  for (const arg of argv) {
+    if (arg === "--")
+      break;
+    if (arg === "--auto" || arg === "--auto=true" || arg === "--yolo" || arg === "--yolo=true" || arg === "--dangerously-skip-permissions" || arg === "--dangerously-skip-permissions=true") {
+      return true;
+    }
+  }
+  return false;
+}
+function getCandidateCliConfigPaths(projectDirectory) {
+  const paths = [];
+  if (projectDirectory) {
+    paths.push(path2.join(projectDirectory, ".opencode", "cli.json"));
+    paths.push(path2.join(projectDirectory, "cli.json"));
+  }
+  if (process.env.OPENCODE_CONFIG_DIR) {
+    paths.push(path2.join(process.env.OPENCODE_CONFIG_DIR, "cli.json"));
+  }
+  const xdgConfigHome = process.env.XDG_CONFIG_HOME || path2.join(homedir(), ".config");
+  paths.push(path2.join(xdgConfigHome, "opencode", "cli.json"));
+  if (process.platform === "win32" && process.env.APPDATA) {
+    paths.push(path2.join(process.env.APPDATA, "opencode", "cli.json"));
+  }
+  return [...new Set(paths)];
+}
+async function readCliConfigPermissionsMode(filePath) {
+  try {
+    const stats = await stat(filePath);
+    const cached = cliConfigCache.get(filePath);
+    if (cached && cached.mtimeMs === stats.mtimeMs && cached.size === stats.size) {
+      return cached.permissions;
+    }
+    const text = await Bun.file(filePath).text();
+    const parsed = parseJsonOrJsonc(text);
+    const permissions = extractSessionPermissionsMode(parsed);
+    cliConfigCache.set(filePath, {
+      mtimeMs: stats.mtimeMs,
+      size: stats.size,
+      permissions
+    });
+    return permissions;
+  } catch {
+    cliConfigCache.delete(filePath);
+    return;
+  }
+}
+async function isAutoAcceptMode(projectDirectory, argv = process.argv.slice(2)) {
+  if (hasAutoAcceptCliFlag(argv)) {
+    return true;
+  }
+  const inlineCliConfig = process.env.OPENCODE_CLI_CONFIG_CONTENT?.trim();
+  if (inlineCliConfig) {
+    try {
+      const parsed = parseJsonOrJsonc(inlineCliConfig);
+      const inlineMode = extractSessionPermissionsMode(parsed);
+      if (inlineMode !== undefined) {
+        return inlineMode === "autoaccept";
+      }
+    } catch {}
+  }
+  for (const candidatePath of getCandidateCliConfigPaths(projectDirectory)) {
+    const mode = await readCliConfigPermissionsMode(candidatePath);
+    if (mode !== undefined) {
+      return mode === "autoaccept";
+    }
+  }
+  return false;
+}
 
 // src/config/resolver.ts
 var EVENT_CONFIG_MAP = {
@@ -3651,7 +3757,8 @@ var SimpleNotificationPlugin = Plugin.define({
     const handler = createNotificationEventHandler({
       scheduler,
       getSessionDetails,
-      isSuppressed: () => tuiConnected
+      isSuppressed: () => tuiConnected,
+      isAutoAccept: (directory) => isAutoAcceptMode(directory ?? ctx.location.directory)
     });
     await ctx.session.hook("prompt", (event) => {
       handler.onPrompt(event.sessionID);

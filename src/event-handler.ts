@@ -22,6 +22,11 @@ export interface NotificationEventHandlerOptions {
 	 * once a TUI plugin instance has connected and taken over notification delivery).
 	 */
 	isSuppressed?: () => boolean;
+	/**
+	 * When true, suppresses `permission.asked` notifications because OpenCode
+	 * is in "auto" mode and auto-accepts permission requests without stopping.
+	 */
+	isAutoAccept?: (directory?: string) => Promise<boolean> | boolean;
 }
 
 export interface NotificationEventHandler {
@@ -61,6 +66,7 @@ export function createNotificationEventHandler({
 	getSessionDetails,
 	shouldHandleSession,
 	isSuppressed,
+	isAutoAccept,
 }: NotificationEventHandlerOptions): NotificationEventHandler {
 	// Tracks sessions where assistant execution has started since the last completion/interruption.
 	const activeSessions = new Set<string>();
@@ -69,6 +75,8 @@ export function createNotificationEventHandler({
 	// Maps subagent child session IDs to their root session ID so interrupting or
 	// prompting the root session also cancels pending subagent permission/form timers.
 	const childToRoot = new Map<string, string>();
+	let eventQueue = Promise.resolve();
+	let disposed = false;
 
 	const recordHierarchy = (
 		sessionId: string,
@@ -110,7 +118,7 @@ export function createNotificationEventHandler({
 		cancelForSession(sessionId);
 	};
 
-	const handleEvent = async (event: OpenCodeEvent): Promise<void> => {
+	const processEvent = async (event: OpenCodeEvent): Promise<void> => {
 		switch (event.type) {
 			case "session.created":
 			case "session.forked": {
@@ -212,6 +220,7 @@ export function createNotificationEventHandler({
 				const details = await getSessionDetails(sessionId, event.location?.directory);
 				recordHierarchy(sessionId, details);
 				if (shouldHandleSession && !shouldHandleSession(sessionId, details)) return;
+				if (await isAutoAccept?.(details.directory)) return;
 
 				const projectName = path.basename(details.directory);
 				scheduler.schedule(
@@ -281,7 +290,17 @@ export function createNotificationEventHandler({
 		}
 	};
 
+	const handleEvent = (event: OpenCodeEvent): Promise<void> => {
+		const next = eventQueue.then(() => {
+			if (disposed) return;
+			return processEvent(event);
+		});
+		eventQueue = next.catch(() => {});
+		return next;
+	};
+
 	const dispose = () => {
+		disposed = true;
 		scheduler.cancelAll();
 		activeSessions.clear();
 		interruptedSessions.clear();

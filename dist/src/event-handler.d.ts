@@ -19,11 +19,16 @@ export interface NotificationEventHandlerOptions {
      * once a TUI plugin instance has connected and taken over notification delivery).
      */
     isSuppressed?: () => boolean;
+    /**
+     * When true, suppresses `permission.asked` notifications because OpenCode
+     * is in "auto" mode and auto-accepts permission requests without stopping.
+     */
+    isAutoAccept?: (directory?: string) => Promise<boolean> | boolean;
 }
 export interface NotificationEventHandler {
     handleEvent: (event: OpenCodeEvent) => Promise<void>;
     onPrompt: (sessionId: string) => void;
     dispose: () => void;
 }
-export declare function createNotificationEventHandler({ scheduler, getSessionDetails, shouldHandleSession, isSuppressed, }: NotificationEventHandlerOptions): NotificationEventHandler;
+export declare function createNotificationEventHandler({ scheduler, getSessionDetails, shouldHandleSession, isSuppressed, isAutoAccept, }: NotificationEventHandlerOptions): NotificationEventHandler;
 //# sourceMappingURL=event-handler.d.ts.map
